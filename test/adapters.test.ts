@@ -10,7 +10,13 @@ import { glmAdapter } from "../src/modules/provider/adapters/glm.ts";
 import { openRouterAdapter } from "../src/modules/provider/adapters/openrouter.ts";
 import { openCodeGoAdapter } from "../src/modules/provider/adapters/opencode-go.ts";
 import { kimiCodingAdapter } from "../src/modules/provider/adapters/kimi-coding.ts";
+import { sub2apiAdapter } from "../src/modules/provider/adapters/sub2api.ts";
+import { metricText, pillText } from "../src/ui/format.ts";
 import { deduplicateSharedQuotaGroups, matchModelAcrossAccounts, isAccountCompatibleWithModel, isAccountRelevantToModels } from "../src/modules/provider/matching.ts";
+
+// Pin the UI language so adapter summaries are asserted against the English
+// strings on every machine (i18n defaults to English, but be explicit).
+process.env.PI_USAGE_LOCALE = "en";
 
 const fixture = async (name: string) => readFile(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
 
@@ -504,4 +510,143 @@ test("kimi-coding adapter handles 429 quota exhausted gracefully", async () => {
   assert.equal(snapshot.state, "empty");
   assert.equal(snapshot.summary, "No active quota");
   assert.equal(snapshot.accounts[0]?.metrics[0]?.kind, "status");
+});
+
+test("sub2api adapter parses the relay wallet response without rescaling the balance", async () => {
+  const body = await fixture("sub2api-usage.json");
+  const providerId = "94cea82e-6ec4-4291-bb30-ebe03520cf4f";
+  const requests: Array<{ url: string; authorization: string | null }> = [];
+  const snapshot = await sub2apiAdapter.fetch({
+    target: { providerId, baseUrl: "https://airopenai.cc", auth: auth("relay-key") },
+    signal: new AbortController().signal,
+    force: false,
+    fetchFn: async (input, init) => {
+      requests.push({ url: String(input), authorization: new Headers(init?.headers).get("Authorization") });
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+
+  assert.deepEqual(requests, [{ url: "https://airopenai.cc/v1/usage", authorization: "Bearer relay-key" }]);
+  assert.equal(snapshot.state, "ok");
+  assert.equal(snapshot.displayName, "Sub2API");
+  assert.equal(snapshot.summary, "Balance 9999392.29 · Today $0.88");
+  assert.equal(snapshot.accounts[0]?.provider, "sub2api");
+  assert.equal(snapshot.accounts[0]?.label, "钱包余额");
+  assert.equal(snapshot.accounts[0]?.status, "available");
+
+  const metrics = snapshot.accounts[0]?.metrics ?? [];
+  const balance = metrics.find((metric) => metric.kind === "balance");
+  assert.ok(balance, "balance metric present");
+  if (balance?.kind === "balance") {
+    assert.equal(balance.amount, 9999392.294712);
+    assert.equal(balance.currency, "");
+    const text = metricText(balance);
+    assert.equal(text, "Balance: 9999392.29");
+    assert.ok(!text.includes("$"), `relay balance must not carry a currency symbol, got ${text}`);
+  }
+
+  const today = metrics.find((metric) => metric.id === "sub2api-today");
+  assert.ok(today, "today metric present");
+  if (today?.kind === "status") assert.equal(today.value, "1 req · 174,117 tok · $0.88");
+
+  assert.equal(pillText(snapshot), "Sub2API · Balance 9999392.29 · Today $0.88");
+});
+
+test("sub2api adapter reports Unknown when the relay exposes no usage data", async () => {
+  const target = {
+    providerId: "94cea82e-6ec4-4291-bb30-ebe03520cf4f",
+    baseUrl: "https://airopenai.cc",
+    auth: auth("relay-key"),
+  };
+  const fetchWith = (response: Response) => sub2apiAdapter.fetch({
+    target,
+    signal: new AbortController().signal,
+    force: false,
+    fetchFn: async () => response,
+  });
+
+  const notFound = await fetchWith(new Response("not found", { status: 404, headers: { "content-type": "text/plain" } }));
+  assert.equal(notFound.state, "unknown");
+  assert.equal(notFound.accounts.length, 0);
+
+  const html = await fetchWith(new Response("<!doctype html><html><body>app</body></html>", { status: 200, headers: { "content-type": "text/html" } }));
+  assert.equal(html.state, "unknown");
+  assert.equal(pillText(html), "Sub2API · Unknown");
+
+  const unparseable = await fetchWith(new Response("<html", { status: 200, headers: { "content-type": "application/json" } }));
+  assert.equal(unparseable.state, "unknown");
+
+  const noQuota = await fetchWith(new Response(JSON.stringify({ planName: "钱包余额", isValid: true }), { status: 200, headers: { "content-type": "application/json" } }));
+  assert.equal(noQuota.state, "unknown");
+  assert.ok(!JSON.stringify(noQuota).includes("relay-key"));
+});
+
+test("sub2api adapter reports Unauthorized when credentials are missing or rejected", async () => {
+  const base = { providerId: "94cea82e-6ec4-4291-bb30-ebe03520cf4f", baseUrl: "https://airopenai.cc" };
+  let calls = 0;
+  const missingKey = await sub2apiAdapter.fetch({
+    target: base,
+    signal: new AbortController().signal,
+    force: false,
+    fetchFn: async () => { calls += 1; return new Response("{}", { status: 200, headers: { "content-type": "application/json" } }); },
+  });
+  assert.equal(missingKey.state, "unauthorized");
+  assert.equal(calls, 0, "no request may be sent without an API key");
+
+  const rejected = await sub2apiAdapter.fetch({
+    target: { ...base, auth: auth("relay-key") },
+    signal: new AbortController().signal,
+    force: false,
+    fetchFn: async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "content-type": "application/json" } }),
+  });
+  assert.equal(rejected.state, "unauthorized");
+  assert.ok(!JSON.stringify(rejected).includes("relay-key"));
+});
+
+test("sub2api adapter claims custom relay hosts only", () => {
+  const providerId = "94cea82e-6ec4-4291-bb30-ebe03520cf4f";
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://airopenai.cc" }), true);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://airopenai.cc/v1" }), true);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://chatgpt.com/backend-api" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://api.deepseek.com" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://api.deepseek.com/v1" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://api.anthropic.com" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://api.x.ai/v1" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://api.z.ai/api/coding/paas/v4" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://openrouter.ai/api/v1" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://opencode.ai/api" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "https://generativelanguage.googleapis.com/v1beta" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId, baseUrl: "://bad-url" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId }), false);
+  // CLIProxyAPI/pi-bridge deployments keep the pi-bridge adapter.
+  assert.equal(sub2apiAdapter.canHandle({ providerId: "MyCPA", baseUrl: "https://cpa.example.com/v1" }), false);
+  assert.equal(sub2apiAdapter.canHandle({ providerId: "cliproxy", baseUrl: "https://relay.example.com" }), false);
+});
+
+test("pi-bridge reports Unknown when the host serves an SPA instead of the usage API", async () => {
+  const snapshot = await cliProxyBridgeAdapter.fetch({
+    target: { providerId: "94cea82e-6ec4-4291-bb30-ebe03520cf4f", baseUrl: "https://airopenai.cc", auth: auth("relay-key") },
+    signal: new AbortController().signal,
+    force: false,
+    fetchFn: async () => new Response("<!doctype html><html><body>SPA</body></html>", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } }),
+  });
+  assert.equal(snapshot.state, "unknown");
+  assert.equal(snapshot.accounts.length, 0);
+  assert.match(snapshot.error ?? "", /pi-bridge/);
+});
+
+test("pi-bridge keeps flagging genuinely incompatible JSON schemas", async () => {
+  const fetchWith = (response: Response) => cliProxyBridgeAdapter.fetch({
+    target: { providerId: "custom-gateway", baseUrl: "https://cpa.example.com/v1", auth: auth() },
+    signal: new AbortController().signal,
+    force: false,
+    fetchFn: async () => response,
+  });
+
+  const wrongSchema = await fetchWith(new Response(JSON.stringify({ schemaVersion: 2, accounts: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+  assert.equal(wrongSchema.state, "incompatible");
+
+  const brokenJson = await fetchWith(new Response("{ not json", { status: 200, headers: { "content-type": "application/json" } }));
+  assert.equal(brokenJson.state, "unknown");
 });

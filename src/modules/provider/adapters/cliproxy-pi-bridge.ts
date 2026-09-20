@@ -74,8 +74,18 @@ export const cliProxyBridgeAdapter: UsageAdapter = {
       if (response.status === 404) return { adapterId: this.id, sourceProviderId: target.providerId, displayName: target.providerId, state: "not-installed", fetchedAt, accounts: [], error: "pi-bridge usage endpoint was not found" };
       if (response.status === 401 || response.status === 403) return { adapterId: this.id, sourceProviderId: target.providerId, displayName: target.providerId, state: "unauthorized", fetchedAt, accounts: [], error: "The API key is not authorized for pi-bridge" };
       if (!response.ok) throw new Error(`pi-bridge returned HTTP ${response.status}`);
-      const data = await response.json() as BridgeUsage;
-      if (data.schemaVersion !== 1) return { adapterId: this.id, sourceProviderId: target.providerId, displayName: target.providerId, state: "incompatible", fetchedAt, accounts: [], error: `Unsupported pi-bridge schemaVersion ${String(data.schemaVersion)}` };
+      // A relay/SPA host answers 200 with its index HTML. That means "no
+      // pi-bridge usage endpoint here", not an incompatible bridge schema.
+      const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+      if (!contentType.includes("json")) return { adapterId: this.id, sourceProviderId: target.providerId, displayName: target.providerId, state: "unknown", fetchedAt, accounts: [], error: "No pi-bridge usage endpoint found on this host (the response was not JSON)" };
+      let data: BridgeUsage | undefined;
+      try {
+        const parsed = await response.json() as unknown;
+        data = parsed && typeof parsed === "object" ? parsed as BridgeUsage : undefined;
+      } catch {
+        return { adapterId: this.id, sourceProviderId: target.providerId, displayName: target.providerId, state: "unknown", fetchedAt, accounts: [], error: "No pi-bridge usage endpoint found on this host (the response body was not valid JSON)" };
+      }
+      if (!data || data.schemaVersion !== 1) return { adapterId: this.id, sourceProviderId: target.providerId, displayName: target.providerId, state: "incompatible", fetchedAt, accounts: [], error: `Unsupported pi-bridge schemaVersion ${String(data?.schemaVersion)}` };
       const accounts = (data.accounts ?? [])
         .map((account, index) => {
           let rawGroups = account.groups ?? [];

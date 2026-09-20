@@ -5,6 +5,9 @@ import test from "node:test";
 import { ProviderUsageController } from "../src/modules/provider/controller.ts";
 import { DEFAULT_CONFIG } from "../src/core/config.ts";
 
+// Pin the UI language: the DeepSeek summary asserted below is an English string.
+process.env.PI_USAGE_LOCALE = "en";
+
 const fixture = async (name: string) => readFile(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
 
 test("controller.refreshAll correctly isolates model baseUrl and filters proxy accounts", async () => {

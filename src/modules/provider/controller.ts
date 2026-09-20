@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AuthResult, Model, Provider } from "@earendil-works/pi-ai";
 import type { UsageConfig } from "../../core/config.ts";
 import { UsageCache } from "../../core/cache.ts";
 import type { Metric, ProviderTarget, UsageAdapter, UsageSnapshot } from "../../core/types.ts";
@@ -12,30 +12,107 @@ import { openCodeGoAdapter } from "./adapters/opencode-go.ts";
 import { openRouterAdapter } from "./adapters/openrouter.ts";
 import { xaiAdapter } from "./adapters/xai.ts";
 import { kimiCodingAdapter } from "./adapters/kimi-coding.ts";
+import { sub2apiAdapter } from "./adapters/sub2api.ts";
 import { chooseAdapter, matchModelAcrossAccounts, isAccountCompatibleWithModel, tokenizeModelId } from "./matching.ts";
 import { relativeTime } from "../../ui/format.ts";
+import { t } from "../../core/i18n.ts";
+import { localProviderEntries, resolveLocalAuth, type LocalProviderEntry } from "../../core/local-auth.ts";
 import { safeError } from "../../core/security.ts";
+
+/**
+ * Hosts differ in what they expose on `ctx.modelRegistry`. PI-Desktop omits the
+ * credential APIs entirely, so every registry call is capability-probed and
+ * missing members degrade to empty/false instead of throwing.
+ */
+interface RegistryLike {
+  getProvider?: (providerId: string) => Provider<Api> | undefined;
+  getProviderAuth?: (providerId: string) => Promise<AuthResult | undefined>;
+  getAll?: () => readonly Model<Api>[];
+  getAvailable?: () => readonly Model<Api>[];
+  getRegisteredProviderIds?: () => readonly string[];
+  getProviderAuthStatus?: (providerId: string) => { configured?: boolean; source?: string } | null | undefined;
+}
+
+function registryOf(ctx: ExtensionContext): RegistryLike {
+  return ctx.modelRegistry as unknown as RegistryLike;
+}
+
+function registeredProviderIds(registry: RegistryLike): readonly string[] {
+  if (typeof registry.getRegisteredProviderIds !== "function") return [];
+  try {
+    return registry.getRegisteredProviderIds() ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function registeredModels(registry: RegistryLike): readonly Model<Api>[] {
+  if (typeof registry.getAll !== "function") return [];
+  try {
+    return registry.getAll() ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function availableModels(registry: RegistryLike): readonly Model<Api>[] {
+  if (typeof registry.getAvailable !== "function") return [];
+  try {
+    return registry.getAvailable() ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function authStatusConfigured(registry: RegistryLike, providerId: string): boolean {
+  if (typeof registry.getProviderAuthStatus !== "function") return false;
+  try {
+    return Boolean(registry.getProviderAuthStatus(providerId)?.configured);
+  } catch {
+    return false;
+  }
+}
 
 export class ProviderUsageController {
   readonly cache = new UsageCache();
   private adapters: UsageAdapter[];
 
   constructor(private config: UsageConfig, private fetchFn: typeof fetch = fetch) {
-    this.adapters = [deepSeekAdapter, openAICodexAdapter, xaiAdapter, anthropicAdapter, glmAdapter, openRouterAdapter, openCodeGoAdapter, kimiCodingAdapter, cliProxyBridgeAdapter];
+    // `sub2api` (relay / 中转站) must precede the pi-bridge adapter: a relay that
+    // returns the SPA HTML on /v0/resource/plugins/pi-bridge/usage would otherwise
+    // be misclassified as an incompatible bridge.
+    this.adapters = [deepSeekAdapter, openAICodexAdapter, xaiAdapter, anthropicAdapter, glmAdapter, openRouterAdapter, openCodeGoAdapter, kimiCodingAdapter, sub2apiAdapter, cliProxyBridgeAdapter];
   }
 
   setConfig(config: UsageConfig): void { this.config = config; }
 
   async target(ctx: ExtensionContext, providerId: string, model?: Model<Api>): Promise<ProviderTarget> {
-    const provider = ctx.modelRegistry.getProvider(providerId);
+    const registry = registryOf(ctx);
+    const provider = typeof registry.getProvider === "function" ? registry.getProvider(providerId) : undefined;
     let auth: ProviderTarget["auth"];
     let authError: string | undefined;
-    try {
-      auth = await ctx.modelRegistry.getProviderAuth(providerId);
-    } catch (error) {
-      // Adapter selection and unsupported-provider reporting must still work
-      // when a provider's credential resolver fails (notably Vertex ADC).
-      authError = safeError(error);
+    let localEntry: LocalProviderEntry | undefined;
+
+    if (typeof registry.getProviderAuth === "function") {
+      try {
+        auth = await registry.getProviderAuth(providerId);
+      } catch (error) {
+        // Adapter selection and unsupported-provider reporting must still work
+        // when a provider's credential resolver fails (notably Vertex ADC).
+        authError = safeError(error);
+      }
+    } else {
+      // PI-Desktop host: the registry exposes no credential resolver, so fall
+      // back to the desktop secret store. A missing entry keeps `auth`
+      // undefined and lets the adapter report `unauthorized`.
+      localEntry = (await localProviderEntries()).find((entry) => entry.providerId === providerId);
+      if (localEntry) {
+        try {
+          auth = await resolveLocalAuth(localEntry);
+        } catch (error) {
+          authError = safeError(error);
+        }
+      }
     }
 
     // Only associate the active model if it actually belongs to this provider!
@@ -46,10 +123,12 @@ export class ProviderUsageController {
     const baseUrl = auth?.auth.baseUrl ?? matchedModel?.baseUrl ?? provider?.baseUrl;
 
     // Collect all models configured in Pi under this specific provider
-    const allModels = ctx.modelRegistry.getAll();
-    const configuredModelIds = allModels
+    const configuredModelIds = registeredModels(registry)
       .filter((m) => m.provider?.toLowerCase() === providerId.toLowerCase())
       .map((m) => m.id);
+    if (!configuredModelIds.length && localEntry?.configuredModelIds?.length) {
+      configuredModelIds.push(...localEntry.configuredModelIds);
+    }
 
     return {
       providerId,
@@ -58,6 +137,7 @@ export class ProviderUsageController {
       ...(auth ? { auth } : {}),
       ...(authError ? { authError } : {}),
       ...(baseUrl ? { baseUrl } : {}),
+      ...(localEntry?.adapter ? { adapterId: localEntry.adapter } : {}),
       ...(configuredModelIds.length ? { configuredModelIds } : {}),
     };
   }
@@ -76,7 +156,11 @@ export class ProviderUsageController {
   }
 
   async fetchTarget(target: ProviderTarget, force = false): Promise<UsageSnapshot> {
-    const adapter = chooseAdapter(target, this.adapters.filter((item) => this.enabled(item)), this.config);
+    const enabledAdapters = this.adapters.filter((item) => this.enabled(item));
+    // A local (PI-Desktop) entry may force an adapter: provider ids there are
+    // UUIDs, which several adapters deliberately reject in `canHandle`.
+    const hinted = target.adapterId ? enabledAdapters.find((item) => item.id === target.adapterId) : undefined;
+    const adapter = hinted ?? chooseAdapter(target, enabledAdapters, this.config);
     const displayName = target.provider?.name ?? target.providerId;
     if (!adapter) return { adapterId: "none", sourceProviderId: target.providerId, displayName, state: "unsupported", fetchedAt: new Date().toISOString(), accounts: [], error: "No enabled usage adapter matched this provider" };
     if (target.authError) return { adapterId: adapter.id, sourceProviderId: target.providerId, displayName, state: "unavailable", fetchedAt: new Date().toISOString(), accounts: [], error: `Provider authentication could not be resolved: ${target.authError}` };
@@ -93,17 +177,18 @@ export class ProviderUsageController {
   }
 
   async refreshAll(ctx: ExtensionContext, force = false): Promise<UsageSnapshot[]> {
+    const registry = registryOf(ctx);
     const providerIds = new Set<string>();
 
     // 1. Providers that have available models registered
-    for (const model of ctx.modelRegistry.getAvailable()) {
+    for (const model of availableModels(registry)) {
       if (model.provider) providerIds.add(model.provider);
     }
 
     // 2. Providers explicitly registered or configured in auth
-    for (const id of ctx.modelRegistry.getRegisteredProviderIds()) {
+    for (const id of registeredProviderIds(registry)) {
       // Only include if provider is actively configured with credentials
-      if (ctx.modelRegistry.getProviderAuthStatus(id).configured) {
+      if (authStatusConfigured(registry, id)) {
         providerIds.add(id);
       }
     }
@@ -123,7 +208,7 @@ export class ProviderUsageController {
       "kimi-coding",
     ];
     for (const id of knownProviders) {
-      if (ctx.modelRegistry.getProviderAuthStatus(id).configured) {
+      if (authStatusConfigured(registry, id)) {
         providerIds.add(id);
       }
     }
@@ -136,6 +221,21 @@ export class ProviderUsageController {
       providerIds.add(ctx.model.provider);
     }
 
+    const targets = await Promise.all([...providerIds].map((id) => this.target(ctx, id)));
+    return Promise.all(targets.map((target) => this.fetchTarget(target, force)));
+  }
+
+  /**
+   * Refresh only the providers this host can actually authenticate: the active
+   * model's provider plus every provider declared in PI-Desktop's
+   * `pi-usage-local.json`. Deduplicated by provider id, same fetch path.
+   */
+  async refreshLocal(ctx: ExtensionContext, force = false): Promise<UsageSnapshot[]> {
+    const providerIds = new Set<string>();
+    if (ctx.model?.provider) providerIds.add(ctx.model.provider);
+    for (const entry of await localProviderEntries()) {
+      providerIds.add(entry.providerId);
+    }
     const targets = await Promise.all([...providerIds].map((id) => this.target(ctx, id)));
     return Promise.all(targets.map((target) => this.fetchTarget(target, force)));
   }
@@ -159,12 +259,12 @@ export class ProviderUsageController {
         const parts = matched.quota.multiWindows.map((q) => {
           const sub = q.label.replace(new RegExp(`^${family}\\s+`, "i"), "");
           const reset = q.resetAt ? relativeTime(q.resetAt) : undefined;
-          return `${sub} ${Math.round(q.remainingFraction * 100)}%${reset ? ` (${reset})` : ""}`;
+          return `${sub} ${Math.round(q.remainingFraction * 100)}%${reset ? t("wrapper.reset", { text: reset }) : ""}`;
         });
         summary = `${family} · ${parts.join(" · ")}`;
       } else {
         const reset = matched.quota.resetAt ? relativeTime(matched.quota.resetAt) : undefined;
-        summary = `${matched.quota.label} ${Math.round(matched.quota.remainingFraction * 100)}%${reset ? ` (${reset})` : ""}`;
+        summary = `${matched.quota.label} ${Math.round(matched.quota.remainingFraction * 100)}%${reset ? t("wrapper.reset", { text: reset }) : ""}`;
       }
 
       return {
@@ -210,7 +310,7 @@ export class ProviderUsageController {
             const parts = quotaMetrics.map((metric) => {
               const label = metric.label.replace(/^Codex\s+/i, "");
               const reset = metric.resetAt ? relativeTime(metric.resetAt) : undefined;
-              return `${label} ${Math.round(metric.remainingFraction * 100)}%${reset ? ` (${reset})` : ""}`;
+              return `${label} ${Math.round(metric.remainingFraction * 100)}%${reset ? t("wrapper.reset", { text: reset }) : ""}`;
             });
             return {
               ...snapshot,
@@ -225,7 +325,7 @@ export class ProviderUsageController {
             return {
               ...snapshot,
               accounts: [first],
-              summary: `${worst.label} ${Math.round(worst.remainingFraction * 100)}%${reset ? ` (${reset})` : ""}`,
+              summary: `${worst.label} ${Math.round(worst.remainingFraction * 100)}%${reset ? t("wrapper.reset", { text: reset }) : ""}`,
             };
           }
         }
@@ -254,7 +354,7 @@ export class ProviderUsageController {
       .sort((a, b) => a.remainingFraction - b.remainingFraction)[0];
 
     const reset = worst?.resetAt ? relativeTime(worst.resetAt) : undefined;
-    const summary = worst ? `${worst.label} ${Math.round(worst.remainingFraction * 100)}%${reset ? ` (${reset})` : ""}` : undefined;
+    const summary = worst ? `${worst.label} ${Math.round(worst.remainingFraction * 100)}%${reset ? t("wrapper.reset", { text: reset }) : ""}` : undefined;
 
     return {
       ...snapshot,

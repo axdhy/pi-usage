@@ -8,6 +8,7 @@ export type UsageState =
   | "not-installed"
   | "unauthorized"
   | "incompatible"
+  | "unknown"
   | "unavailable";
 
 export type Metric =
@@ -48,6 +49,8 @@ export interface ProviderTarget {
   baseUrl?: string;
   auth?: AuthResult;
   authError?: string;
+  /** Local (PI-Desktop) hint that forces a specific usage adapter, bypassing `canHandle`. */
+  adapterId?: string;
   configuredModelIds?: string[];
 }
 

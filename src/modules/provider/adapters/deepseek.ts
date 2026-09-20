@@ -1,6 +1,6 @@
+import { t } from "../../../core/i18n.ts";
 import type { UsageAdapter, UsageSnapshot } from "../../../core/types.ts";
 import { safeError, sameOriginFetch } from "../../../core/security.ts";
-
 type BalanceInfo = {
   currency?: string;
   total_balance?: string | number | null;
@@ -52,7 +52,7 @@ export const deepSeekAdapter: UsageAdapter = {
         const granted = number(info.granted_balance);
         const topped = number(info.topped_up_balance);
         const detail = [topped !== undefined ? `Paid ${format(topped, currency)}` : undefined, granted !== undefined ? `Granted ${format(granted, currency)}` : undefined].filter(Boolean).join(" · ");
-        return [{ kind: "balance" as const, id: `balance-${currency}-${index}`, label: "Balance", amount: total, currency, ...(detail ? { detail } : {}) }];
+        return [{ kind: "balance" as const, id: `balance-${currency}-${index}`, label: t("label.balance"), amount: total, currency, ...(detail ? { detail } : {}) }];
       });
       const summary = metrics.map((metric) => format(metric.amount, metric.currency)).join(" · ");
       return {
@@ -62,7 +62,7 @@ export const deepSeekAdapter: UsageAdapter = {
         state: metrics.length ? "ok" : "empty",
         fetchedAt,
         accounts: [{ id: target.providerId, provider: "deepseek", label: "DeepSeek API", status: data.is_available === false ? "unavailable" : "available", metrics }],
-        ...(summary ? { summary: `Balance ${summary}` } : {}),
+        ...(summary ? { summary: `${t("label.balance")} ${summary}` } : {}),
       };
     } catch (error) {
       throw new Error(safeError(error));
